@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.22;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract InheritanceWithHeartbeatAndMultisig is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+   
+    struct Beneficiary {
+        address recipient;
+        uint256 share; 
+        bool claimed;
+    }
+
+// Beneficiary ： 受益人
+// recipient：受益人地址。
+// share：分配份额（万分比，10000 = 100%）。
+// claimed：是否已领取资产
+
+   
+    struct Proposal {
+        bool exists;
+        uint256 signatureCount;
+        bool executed;
+    }
+//  exists：提案是否存在。
+// signatureCount：签名计数。
+// executed：提案是否已执行。
+
+
+    mapping(address => Beneficiary) public beneficiaries;  
+    // beneficiaries：映射存储受益人信息
+    address[] public beneficiaryList;
+    // beneficiaryList：动态数组，记录受益人地址
+    uint256 public lastActive;
+    // lastActive：Owner 最后活动时间，用于心跳检测
+    uint256 public constant INACTIVITY_PERIOD = 90 days;
+    // INACTIVITY_PERIOD：常量，90 天（7,776,000 秒），触发继承的条件。
+    bool public inheritanceTriggered;
+    // inheritanceTriggered：布尔值，标记继承是否触发
+    address[] public validators; 
+    // validators：白名单验证者数组
+    uint256 public requiredSignatures; 
+    // requiredSignatures：触发继承所需签名数
+    uint256 public currentProposalId;
+    // currentProposalId：当前提案 ID，递增生成
+    mapping(uint256 => Proposal) public proposals;
+    // proposals：映射存储提案信息，键为提案 ID
+    mapping(uint256 => mapping(address => bool)) public proposalSignatures;
+    // proposalSignatures：嵌套映射，记录每个提案的签名状态
+    mapping(address => bool) public supportedTokens;
+    // supportedTokens：映射，记录支持的 ERC-20 代币。
+    address[] public tokenList;
+    // tokenList：动态数组，记录支持的 ERC-20 代币地址
+
+    // Events for transparency
+    event BeneficiaryAdded(address indexed beneficiary, uint256 share);
+    event BeneficiaryUpdated(address indexed beneficiary, uint256 newShare);
+    event BeneficiaryRemoved(address indexed beneficiary);
+    event InheritanceTriggered(address indexed triggerer, uint256 timestamp, uint256 proposalId);
+    event AssetsClaimed(address indexed beneficiary, uint256 ethAmount, address indexed token, uint256 tokenAmount);
+    event EmergencyWithdraw(address indexed owner, uint256 ethAmount, address indexed token, uint256 tokenAmount);
+    event ProposalSubmitted(address indexed proposer, uint256 proposalId);
+    event ProposalConfirmed(address indexed validator, uint256 proposalId);
+    event ValidatorAdded(address indexed validator);
+    event ValidatorRemoved(address indexed validator);
+    event TokenAdded(address indexed token);
+    event HeartbeatUpdated(address indexed owner, uint256 timestamp);
+    // 事件：记录关键操作（如添加受益人、触发继承），便于链下跟踪。
+
+    // Errors
+    error InvalidBeneficiary();
+    error InvalidShare();
+    error InheritanceAlreadyTriggered();
+    error NotTriggered();
+    error AlreadyClaimed();
+    error InactivityPeriodNotExpired();
+    error InvalidValidators();
+    error NotValidator();
+    error AlreadySigned();
+    error NoBeneficiaries();
+    error ProposalNotExists();
+    error ProposalAlreadyExecuted();
+    error UnsupportedToken();
+    // 错误定义：使用自定义错误，节省 gas 费用。
+
+   
+    constructor(address[] memory _validators, uint256 _requiredSignatures) Ownable(msg.sender) {
+        if (_validators.length == 0 || _requiredSignatures == 0 || _requiredSignatures > _validators.length) {
+            revert InvalidValidators();
+            // 确保验证者非空、签名数有效（0 < _requiredSignatures ≤ 验证者数量
+        }
+        for (uint256 i = 0; i < _validators.length; i++) {
+            if (_validators[i] == address(0)) revert InvalidValidators();
+            validators.push(_validators[i]);
+            emit ValidatorAdded(_validators[i]);
+        }
+        requiredSignatures = _requiredSignatures;
+        lastActive = block.timestamp;
+        emit HeartbeatUpdated(msg.sender, lastActive);
+    }
+    // 初始化 Owner（msg.sender），设置验证者列表和所需签名数，记录部署时间
+
+
+    function heartbeat() external onlyOwner {
+        lastActive = block.timestamp;
+        emit HeartbeatUpdated(msg.sender, lastActive);
+    }
+    // 逻辑：Owner 调用，更新 lastActive 为当前区块时间，触发 HeartbeatUpdated 事件。防止 90 天无活动触发继承，证明 Owner “存活”
+
+   
+    function addBeneficiary(address _beneficiary, uint256 _share) external onlyOwner {
+        if (_beneficiary == address(0)) revert InvalidBeneficiary();
+        if (_share == 0 || _share > 10000) revert InvalidShare();
+        if (inheritanceTriggered) revert InheritanceAlreadyTriggered();
+
+        if (beneficiaries[_beneficiary].recipient == address(0)) {
+            beneficiaryList.push(_beneficiary);
+            beneficiaries[_beneficiary] = Beneficiary(_beneficiary, _share, false);
+            emit BeneficiaryAdded(_beneficiary, _share);
+        } else {
+            beneficiaries[_beneficiary].share = _share;
+            emit BeneficiaryUpdated(_beneficiary, _share);
+        }
+
+        uint256 totalShares = 0;
+        for (uint256 i = 0; i < beneficiaryList.length; i++) {
+            totalShares += beneficiaries[beneficiaryList[i]].share;
+        }
+        require(totalShares <= 10000, "Total shares exceed 100%");
+    }
+
+    // 添加或更新受益人，校验地址、份额（0 < _share ≤ 10000）、未触发继承。总份额不得超 100%。
+
+  
+    function removeBeneficiary(address _beneficiary) external onlyOwner {
+        if (inheritanceTriggered) revert InheritanceAlreadyTriggered();
+        if (beneficiaries[_beneficiary].recipient == address(0)) revert InvalidBeneficiary();
+
+        delete beneficiaries[_beneficiary];
+        for (uint256 i = 0; i < beneficiaryList.length; i++) {
+            if (beneficiaryList[i] == _beneficiary) {
+                beneficiaryList[i] = beneficiaryList[beneficiaryList.length - 1];
+                beneficiaryList.pop();
+                break;
+            }
+        }
+        emit BeneficiaryRemoved(_beneficiary);
+    }
+
+    // 移除受益人，使用“交换并弹出”减少 gas
+
+       function addToken(address _token) external onlyOwner {
+        if (_token == address(0)) revert UnsupportedToken();
+        if (!supportedTokens[_token]) {
+            supportedTokens[_token] = true;
+            tokenList.push(_token);
+            emit TokenAdded(_token);
+        }
+    }
+    // Owner 添加支持的 ERC-20 代币，记录在 supportedTokens 和 tokenList。
+
+   
+    function addValidator(address _validator) external onlyOwner {
+        if (_validator == address(0)) revert InvalidValidators();
+        for (uint256 i = 0; i < validators.length; i++) {
+            if (validators[i] == _validator) revert InvalidValidators();
+        }
+        validators.push(_validator);
+        emit ValidatorAdded(_validator);
+    }
+// addValidator：添加验证者，校验非零地址和无重复。
+   
+    function removeValidator(address _validator) external onlyOwner {
+        for (uint256 i = 0; i < validators.length; i++) {
+            if (validators[i] == _validator) {
+                validators[i] = validators[validators.length - 1];
+                validators.pop();
+                emit ValidatorRemoved(_validator);
+                if (requiredSignatures > validators.length) {
+                    requiredSignatures = validators.length;
+                }
+                return;
+            }
+        }
+        revert InvalidValidators();
+    }
+
+    // removeValidator：移除验证者，调整 requiredSignatures（若超过验证者数量）。
+
+   
+    function submitProposal() external {
+        if (!isValidator(msg.sender)) revert NotValidator();
+        if (inheritanceTriggered) revert InheritanceAlreadyTriggered();
+        if (beneficiaryList.length == 0) revert NoBeneficiaries();
+
+        currentProposalId++;
+        proposals[currentProposalId] = Proposal(true, 0, false);
+        emit ProposalSubmitted(msg.sender, currentProposalId);
+    }
+    // submitProposal：验证者提交新提案，递增 currentProposalId。
+    // 通过多签或心跳检测触发继承。
+
+    function confirmProposal(uint256 _proposalId) external {
+        Proposal storage proposal = proposals[_proposalId];
+        if (!proposal.exists) revert ProposalNotExists();
+        if (proposal.executed) revert ProposalAlreadyExecuted();
+        if (!isValidator(msg.sender)) revert NotValidator();
+        if (proposalSignatures[_proposalId][msg.sender]) revert AlreadySigned();
+        if (inheritanceTriggered) revert InheritanceAlreadyTriggered();
+
+        proposalSignatures[_proposalId][msg.sender] = true;
+        proposal.signatureCount++;
+
+        if (proposal.signatureCount >= requiredSignatures || block.timestamp >= lastActive + INACTIVITY_PERIOD) {
+            inheritanceTriggered = true;
+            proposal.executed = true;
+            emit InheritanceTriggered(msg.sender, block.timestamp, _proposalId);
+        }
+        emit ProposalConfirmed(msg.sender, _proposalId);
+    }
+      //confirmProposal：验证者确认提案，记录签名，达到 requiredSignatures 或 90 天无活动后触发继承。
+      function claim(address _token) external nonReentrant {
+        if (!inheritanceTriggered) revert NotTriggered();
+        Beneficiary storage beneficiary = beneficiaries[msg.sender];
+        if (beneficiary.recipient == address(0)) revert InvalidBeneficiary();
+        if (beneficiary.claimed) revert AlreadyClaimed();
+        if (_token != address(0) && !supportedTokens[_token]) revert UnsupportedToken();
+
+        beneficiary.claimed = true;
+        uint256 share = beneficiary.share;
+
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            uint256 ethAmount = (ethBalance * share) / 10000;
+            (bool success, ) = payable(msg.sender).call{value: ethAmount}("");
+            require(success, "ETH transfer failed");
+            emit AssetsClaimed(msg.sender, ethAmount, address(0), 0);
+        }
+
+        if (_token != address(0)) {
+            IERC20 token = IERC20(_token);
+            uint256 tokenBalance = token.balanceOf(address(this));
+            if (tokenBalance > 0) {
+                uint256 tokenAmount = (tokenBalance * share) / 10000;
+                SafeERC20.safeTransfer(token, msg.sender, tokenAmount);
+                emit AssetsClaimed(msg.sender, 0, _token, tokenAmount);
+            }
+        }
+    }
+
+// 校验：继承已触发、调用者为受益人、未领取、代币受支持。
+// 分配 ETH 和 ERC-20 代币，按份额计算（balance * share / 10000）。
+// 使用 SafeERC20.safeTransfer 确保代币转移安全。
+
+    function emergencyWithdraw(address _token) external onlyOwner nonReentrant {
+        if (inheritanceTriggered) revert InheritanceAlreadyTriggered();
+        if (_token != address(0) && !supportedTokens[_token]) revert UnsupportedToken();
+
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            (bool success, ) = payable(owner()).call{value: ethBalance}("");
+            require(success, "ETH withdraw failed");
+            emit EmergencyWithdraw(owner(), ethBalance, address(0), 0);
+        }
+
+        if (_token != address(0)) {
+            IERC20 token = IERC20(_token);
+            uint256 tokenBalance = token.balanceOf(address(this));
+            if (tokenBalance > 0) {
+                SafeERC20.safeTransfer(token, owner(), tokenBalance);
+                emit EmergencyWithdraw(owner(), 0, _token, tokenBalance);
+            }
+        }
+    }
+    // 逻辑：Owner 撤回所有 ETH 和指定 ERC-20 代币，需在继承触发前。
+
+   
+    function isValidator(address _validator) public view returns (bool) {
+        for (uint256 i = 0; i < validators.length; i++) {
+            if (validators[i] == _validator) return true;
+        }
+        return false;
+    }
+    // isValidator：检查地址是否为验证者
+
+    receive() external payable {}
+
+    function getBeneficiaries() external view returns (address[] memory) {
+        return beneficiaryList;
+    }
+    // getBeneficiaries : 获取所有受益人地址
+
+    function getValidators() external view returns (address[] memory) {
+        return validators;
+    //    getValidators : 获取所有验证者地址
+    }
+
+    function getSupportedTokens() external view returns (address[] memory) {
+        return tokenList;
+    }
+}
+     //. getSupportedTokens : 获取所有支持的 ERC-20 代币地址
